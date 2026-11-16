@@ -6,6 +6,7 @@ import Handlebars from 'handlebars';
 import ipMatching from 'ip-matching';
 import isDocker from 'is-docker';
 
+import { isTrustedGenerationJobRelay } from '../generation-job-relay.js';
 import { filterValidIpPatterns, getIpFromRequest, getRealOrForwardedIp } from '../express-common.js';
 import { color, getConfigValue, safeReadFileSync } from '../util.js';
 
@@ -66,6 +67,12 @@ export default async function getWhitelistMiddleware() {
     await addDockerHostsToWhitelist();
 
     return function (req, res, next) {
+        // The original browser request already passed the whitelist. Its authenticated server-side relay
+        // must be allowed through even though this second local connection originates from loopback.
+        if (isTrustedGenerationJobRelay(req)) {
+            return next();
+        }
+
         const clientIp = getIpFromRequest(req);
         const forwardedIp = enableForwardedWhitelist && getRealOrForwardedIp(req);
         const userAgent = req.headers['user-agent'];

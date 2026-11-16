@@ -67,6 +67,7 @@ import { UPLOADS_DIRECTORY } from './constants.js';
 
 // Routers
 import { router as usersPublicRouter } from './endpoints/users-public.js';
+import { router as generationJobsRouter } from './endpoints/generation-jobs.js';
 import { init as statsInit, onExit as statsOnExit } from './endpoints/stats.js';
 import { checkForNewContent } from './endpoints/content-manager.js';
 import { init as settingsInit } from './endpoints/settings.js';
@@ -253,6 +254,8 @@ app.post('/api/ping', (request, response) => {
 
     response.sendStatus(204);
 });
+
+app.use('/api/generation-jobs', generationJobsRouter);
 
 if (cliArgs.enableCorsProxy) {
     app.use('/proxy/:url(*)', corsProxyMiddleware);

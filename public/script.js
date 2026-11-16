@@ -10,6 +10,15 @@ import {
     default as libs,
     lodash,
 } from './lib.js';
+import {
+    acknowledgeGenerationJob,
+    acknowledgeGenerationJobs,
+    cancelActiveGenerationJobs,
+    forgetGenerationJobTracking,
+    getRecoverableGenerationJobs,
+    setGenerationJobContext,
+    setPendingGenerationJob,
+} from './scripts/generation-jobs.js';
 
 import { humanizedDateTime, favsToHotswap, getMessageTimeStamp, dragElement, isMobile, initRossMods } from './scripts/RossAscends-mods.js';
 import { userStatsHandler, statMesProcess, initStats } from './scripts/stats.js';
@@ -788,6 +797,96 @@ async function firstLoadInit() {
     await initLoaderHandle.hide();
     await fixViewport();
     await eventSource.emit(event_types.APP_READY);
+    eventSource.on(event_types.CHAT_CHANGED, () => {
+        void restoreGenerationJob();
+    });
+    window.addEventListener('online', () => {
+        void restoreGenerationJob();
+    });
+    void restoreGenerationJob();
+}
+
+let isRestoringGenerationJob = false;
+
+function getGenerationChatKey() {
+    const chatId = getCurrentChatId() || '';
+    if (selected_group) {
+        return 'group:' + selected_group + ':' + chatId;
+    }
+    const character = characters[this_chid];
+    return 'character:' + (character?.avatar || '') + ':' + chatId;
+}
+
+function setGenerationJobMetadata(type, onJobStarted) {
+    const supportedApis = ['openai', 'textgenerationwebui', 'novel', 'kobold'];
+    if (!supportedApis.includes(main_api) || ['quiet', 'impersonate'].includes(type)) {
+        setGenerationJobContext(null);
+        return;
+    }
+
+    setGenerationJobContext({
+        chatKey: getGenerationChatKey(),
+        generationType: String(type),
+        mainApi: String(main_api || ''),
+        completionSource: String(main_api === 'openai' ? oai_settings.chat_completion_source : main_api || ''),
+        stream: Boolean(isStreamingEnabled() && type !== 'quiet'),
+        createdAt: Date.now(),
+        onJobStarted,
+    });
+}
+
+async function restoreGenerationJob() {
+    if (isRestoringGenerationJob || is_send_press || !token) return;
+    isRestoringGenerationJob = true;
+    const requestedChatKey = getGenerationChatKey();
+    try {
+        const recoverableJobs = await getRecoverableGenerationJobs(getRequestHeaders());
+        const currentChatKey = getGenerationChatKey();
+        if (currentChatKey !== requestedChatKey) return;
+        const currentCompletionSource = String(main_api === 'openai' ? oai_settings.chat_completion_source : main_api || '');
+        const currentStreaming = Boolean(isStreamingEnabled());
+        const job = recoverableJobs.find(item =>
+            item.metadata?.chatKey === currentChatKey &&
+            item.metadata?.mainApi === main_api &&
+            item.metadata?.completionSource === currentCompletionSource &&
+            item.metadata?.stream === currentStreaming &&
+            ['openai', 'textgenerationwebui', 'novel', 'kobold'].includes(item.metadata?.mainApi) &&
+            !['quiet', 'impersonate'].includes(item.metadata?.generationType));
+
+        if (!job) return;
+
+        const alreadyApplied = chat.some(message => message?.extra?.generation_job_id === job.id);
+        if (alreadyApplied) {
+            await acknowledgeGenerationJob(job.id, getRequestHeaders());
+            return;
+        }
+
+        const confirmed = await Popup.show.confirm(
+            t`A generation was left unfinished`,
+            t`SillyTavern found a generation for this chat that can be restored. Continue receiving its answer?`,
+        );
+        if (!confirmed) return;
+        if (getGenerationChatKey() !== currentChatKey) return;
+
+        if (job.status === 'interrupted') {
+            toastr.warning(
+                t`The server restarted during generation. The saved partial response will be restored.`,
+                t`Partial response`,
+            );
+        }
+        setPendingGenerationJob(job.id);
+        await Generate(job.metadata.generationType || 'normal');
+    } catch (error) {
+        setPendingGenerationJob(null);
+        console.error('Could not restore a generation job:', error);
+    } finally {
+        setGenerationJobContext(null);
+        setPendingGenerationJob(null);
+        isRestoringGenerationJob = false;
+        if (!is_send_press && getGenerationChatKey() !== requestedChatKey) {
+            queueMicrotask(() => void restoreGenerationJob());
+        }
+    }
 }
 
 async function fixViewport() {
@@ -3632,6 +3731,10 @@ class StreamingProcessor {
         } else {
             await saveReply({ type: this.type, getMessage: text, fromStreaming: true });
             messageId = chat.length - 1;
+            if (this.generationJobId && chat[messageId] && !chat[messageId].is_user) {
+                chat[messageId].extra = chat[messageId].extra || {};
+                chat[messageId].extra.generation_job_id = this.generationJobId;
+            }
             await this.#checkDomElements(messageId, continueOnReasoning);
             this.markUIGenStarted();
         }
@@ -3687,6 +3790,9 @@ class StreamingProcessor {
                 chat[messageId].extra = {};
             }
             chat[messageId].extra.time_to_first_token = this.timeToFirstToken;
+            if (this.generationJobId) {
+                chat[messageId].extra.generation_job_id = this.generationJobId;
+            }
 
             // Update reasoning
             await this.reasoningHandler.process(messageId, mesChanged, this.promptReasoning);
@@ -3756,6 +3862,10 @@ class StreamingProcessor {
         await this.onProgressStreaming(messageId, text, true);
         const messageElement = chatElement.find(`.mes[mesid="${messageId}"]`);
         const message = chat[messageId];
+        if (this.generationJobId && message && !message.is_user) {
+            message.extra = message.extra || {};
+            message.extra.generation_job_id = this.generationJobId;
+        }
         addCopyToCodeBlocks(messageElement);
 
         await this.reasoningHandler.finish(messageId);
@@ -3813,15 +3923,22 @@ class StreamingProcessor {
             return await swipe(null, SWIPE_DIRECTION.RIGHT, { source: SWIPE_SOURCE.AUTO_SWIPE, repeated: true, forceMesId: chat.length - 1 });
         }
         await saveChatConditional();
+        await acknowledgeGenerationJobs(getRequestHeaders());
 
         playMessageSound();
     }
 
-    onErrorStreaming() {
+    async onErrorStreaming() {
         this.abortController.abort();
         this.isStopped = true;
 
         this.markUIGenStopped();
+
+        if (this.messageId >= 0 && this.type !== 'impersonate') {
+            await saveChatConditional();
+            await acknowledgeGenerationJobs(getRequestHeaders());
+        }
+        forgetGenerationJobTracking();
 
         const noEmitTypes = ['swipe', 'impersonate', 'continue'];
         if (!noEmitTypes.includes(this.type)) {
@@ -3846,6 +3963,7 @@ class StreamingProcessor {
 
     onStopStreaming() {
         this.abortController.abort();
+        cancelActiveGenerationJobs(getRequestHeaders());
         this.isFinished = true;
     }
 
@@ -3901,7 +4019,7 @@ class StreamingProcessor {
             // in the case of a self-inflicted abort, we have already cleaned up
             if (!this.isFinished) {
                 console.error(err);
-                this.onErrorStreaming();
+                await this.onErrorStreaming();
             }
             return this.result;
         }
@@ -4289,6 +4407,7 @@ function removeLastMessage() {
  */
 export async function Generate(type, { automatic_trigger, force_name2, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage, quietName, jsonSchema = null, depth = 0 } = {}, dryRun = false) {
     console.log('Generate entered');
+    let generationJobId = null;
     setGenerationProgress(0);
     generation_started = new Date();
 
@@ -5390,6 +5509,10 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
                 streamingProcessor.firstMessageText = '';
             }
 
+            setGenerationJobMetadata(type, id => {
+                generationJobId = id;
+                if (streamingProcessor) streamingProcessor.generationJobId = id;
+            });
             streamingProcessor.generator = await sendStreamingRequest(type, generate_data, { jsonSchema });
 
             hideSwipeButtons();
@@ -5446,6 +5569,7 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
                 });
             }
         } else {
+            setGenerationJobMetadata(type, id => { generationJobId = id; });
             return await sendGenerationRequest(type, generate_data, { jsonSchema });
         }
     }
@@ -5534,6 +5658,12 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
                 ({ type, getMessage } = await saveReply({ type: 'appendFinal', getMessage, title, swipes, reasoning, imageUrls, reasoningSignature }));
             }
 
+            const savedMessage = chat[chat.length - 1];
+            if (generationJobId && savedMessage && !savedMessage.is_user) {
+                savedMessage.extra = savedMessage.extra || {};
+                savedMessage.extra.generation_job_id = generationJobId;
+            }
+
             // This relies on `saveReply` having been called to add the message to the chat, so it must be last.
             parseAndSaveLogprobs(data, continue_mag);
         }
@@ -5571,6 +5701,7 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
 
         console.debug('/api/chats/save called by /Generate');
         await saveChatConditional();
+        await acknowledgeGenerationJobs(getRequestHeaders());
         unblockGeneration(type);
         streamingProcessor = null;
 
@@ -5587,13 +5718,15 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
      * @param {Error|object} exception Error or response JSON
      * @throws {Error|object} Re-throws the exception
      */
-    function onError(exception) {
+    async function onError(exception) {
         // if the response JSON was thrown (novel|textgenerationwebui|kobold), show the error message
         if (typeof exception?.error?.message === 'string') {
             toastr.error(exception.error.message, t`Text generation error`, { timeOut: 10000, extendedTimeOut: 20000 });
         }
 
         unblockGeneration(type);
+        await acknowledgeGenerationJobs(getRequestHeaders());
+        forgetGenerationJobTracking();
         console.log(exception);
         streamingProcessor = null;
         throw exception;
@@ -5606,6 +5739,7 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
  */
 export function stopGeneration() {
     let stopped = false;
+    const wasStreaming = Boolean(streamingProcessor);
     if (streamingProcessor) {
         streamingProcessor.onStopStreaming();
         stopped = true;
@@ -5614,6 +5748,9 @@ export function stopGeneration() {
         abortController.abort('Clicked stop button');
         hideStopButton();
         stopped = true;
+    }
+    if (!wasStreaming) {
+        cancelActiveGenerationJobs(getRequestHeaders());
     }
     eventSource.emit(event_types.GENERATION_STOPPED);
     return stopped;
@@ -12463,8 +12600,7 @@ jQuery(async function () {
     $(window).on('beforeunload', () => {
         cancelTtsPlay();
         if (streamingProcessor) {
-            console.log('Page reloaded. Aborting streaming...');
-            streamingProcessor.onStopStreaming();
+            console.log('Page is closing. The server will keep the generation running.');
         }
     });
 
